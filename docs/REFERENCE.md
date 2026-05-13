@@ -14,6 +14,7 @@ Complete reference for oh-my-claudecode. For quick start, see the main [README.m
 - [Agents (29 Total)](#agents-29-total)
 - [Skills (38 Total)](#skills-38-total)
 - [Slash Commands](#slash-commands)
+- [Claude Code `/goal` Adapter Design](#claude-code-goal-adapter-design)
 - [Hooks System](#hooks-system)
 - [Magic Keywords](#magic-keywords)
 - [Platform Support](#platform-support)
@@ -619,6 +620,20 @@ When present, OMC appends a standardized **Skill Pipeline** section to the rende
 OMC's canonical project-local skill directory remains `.omc/skills/`, but the runtime now also reads compatibility skills from `.agents/skills/`.
 
 For builtin and slash-loaded skills, OMC also appends a standardized **Skill Resources** section when the skill directory contains bundled assets such as helper scripts, templates, or support libraries. This helps agents reuse packaged skill resources instead of recreating them ad hoc.
+
+---
+
+## Claude Code `/goal` Adapter Design
+
+OMC treats Claude Code `/goal` as a native execution loop that can be handed off to, not as the durable source of truth for OMC completion. The design contract is documented in [docs/design/CLAUDE_CODE_GOAL_ADAPTER.md](./design/CLAUDE_CODE_GOAL_ADAPTER.md).
+
+Key contract points:
+
+- Claude Code `/goal` facts must cite Claude Code or Anthropic sources only. OpenAI/Codex references are comparison sources, not authority for Claude Code behavior.
+- The adapter renders a measurable `/goal <condition>` handoff; it must not mutate hidden Claude Code session state directly.
+- The deterministic conflict policy is exactly one of `refuse`, `adopt_existing`, or `artifact_only`; competing Ralph/autopilot/Stop-hook/Team/UltraQA loops must not continue with only a warning.
+- `/goal` evaluator success is evidence for OMC final review, not completion by itself; OMC still requires surfaced command/test/docs evidence.
+- OMC stores durable goal ledgers and evidence under OMC-owned logical artifacts and `.omc/`-resolved paths, not hardcoded `.omx/` paths.
 
 ---
 
