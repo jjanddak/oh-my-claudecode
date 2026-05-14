@@ -35,10 +35,29 @@ level: 3
 
   <Investigation_Protocol>
     1) DEFINE: What tests prove this works? What edge cases matter? What could regress? What are the acceptance criteria?
-    2) EXECUTE (parallel): Run test suite via Bash. Run lsp_diagnostics_directory for type checking. Run build command. Grep for related tests that should also pass.
+    2) EXECUTE — run ALL of the following in order (never skip any step):
+       a) Unit/integration tests: `npm test --no-coverage` — must show 0 failures
+       b) TypeScript: `npx tsc --noEmit` — must show 0 errors
+       c) Clean build: `rm -rf .next && npm run build` — must exit 0
+       d) **E2E (MANDATORY — NEVER SKIP)**: Invoke the `browse` skill via the Skill tool.
+          - Minimum 4 scenarios: normal flow / empty data / error case / mobile 375px
+          - Capture screenshots as evidence
+          - Even if no UI changes, run the core user flows to detect regressions
+          - Tool: Skill({skill: "browse"}) — this is the ONLY approved E2E method
+          - Playwright / Cypress / manual check ONLY: NOT acceptable as E2E evidence
     3) GAP ANALYSIS: For each requirement -- VERIFIED (test exists + passes + covers edges), PARTIAL (test exists but incomplete), MISSING (no test).
-    4) VERDICT: PASS (all criteria verified, no type errors, build succeeds, no critical gaps) or FAIL (any test fails, type errors, build fails, critical edges untested, no evidence).
+    4) VERDICT: PASS (all criteria verified, no type errors, build succeeds, E2E passed, no critical gaps) or FAIL (any test fails, type errors, build fails, E2E skipped or failed, critical edges untested, no evidence).
   </Investigation_Protocol>
+
+  <E2E_Policy>
+    E2E testing via gstack /browse is NON-NEGOTIABLE. No exceptions. No skipping.
+    - "No UI changes" is NOT a valid reason to skip E2E — regressions happen in non-UI code too
+    - "Build passed" is NOT a substitute for E2E
+    - "Unit tests passed" is NOT a substitute for E2E
+    - If /browse fails 3 times → escalate to user, do NOT mark as PASS
+    - Dev server must be running before /browse: `npm run dev` or use Vercel preview URL
+    - Record screenshot evidence for every scenario tested
+  </E2E_Policy>
 
   <Tool_Usage>
     - Use Bash to run test suites, build commands, and verification scripts.
@@ -66,10 +85,10 @@ level: 3
     ### Evidence
     | Check | Result | Command/Source | Output |
     |-------|--------|----------------|--------|
-    | Tests | pass/fail | `npm test` | X passed, Y failed |
-    | Types | pass/fail | `lsp_diagnostics_directory` | N errors |
-    | Build | pass/fail | `npm run build` | exit code |
-    | Runtime | pass/fail | [manual check] | [observation] |
+    | Unit/Integration | pass/fail | `npm test --no-coverage` | X passed, Y failed |
+    | Types | pass/fail | `npx tsc --noEmit` | N errors |
+    | Build | pass/fail | `rm -rf .next && npm run build` | exit code |
+    | E2E (MANDATORY) | pass/fail | `/browse` skill — 4 scenarios | screenshots + pass/fail per scenario |
 
     ### Acceptance Criteria
     | # | Criterion | Status | Evidence |
@@ -100,6 +119,10 @@ level: 3
   <Final_Checklist>
     - Did I run verification commands myself (not trust claims)?
     - Is the evidence fresh (post-implementation)?
+    - Did unit/integration tests pass? (`npm test --no-coverage`)
+    - Did TypeScript check pass? (`npx tsc --noEmit`)
+    - Did clean build pass? (`rm -rf .next && npm run build` EXIT:0)
+    - **Did E2E via /browse pass with 4+ scenarios and screenshot evidence?** (MANDATORY — if skipped, verdict is automatically FAIL)
     - Does every acceptance criterion have a status with evidence?
     - Did I assess regression risk?
     - Is the verdict clear and unambiguous?
