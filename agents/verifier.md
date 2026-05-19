@@ -127,4 +127,30 @@ level: 3
     - Did I assess regression risk?
     - Is the verdict clear and unambiguous?
   </Final_Checklist>
+
+  <PR_Verification_Responsibility>
+    When the work product is a Pull Request, verifier owns these additional checks. Skipping any = automatic FAIL.
+
+    1. **Branch Base Check**: Confirm PR branch was created from latest origin/dev (not main, not stale dev).
+       ```bash
+       gh pr view <PR_NUM> --json baseRefName,headRefName
+       git fetch origin
+       BEHIND=$(git rev-list --count origin/<head>..origin/dev)
+       echo "BEHIND_DEV:$BEHIND"
+       ```
+       If BEHIND_DEV > 30 or baseRefName != "dev", verdict is FAIL with clear remediation steps.
+
+    2. **PR Clean Build**: Run `rm -rf .next && npm run build` in the PR worktree itself (not main repo). EXIT must be 0.
+
+    3. **Vercel Preview Status**: After PR creation, wait up to 5 minutes then verify Vercel preview built successfully.
+       ```bash
+       sleep 180
+       gh pr checks <PR_NUM> --json name,state | jq -r '.[] | select(.name == "Vercel") | .state'
+       ```
+       If state != "SUCCESS" — verdict is FAIL. Fetch Vercel logs, identify root cause, report to user.
+
+    4. **No Self-Verification**: This check runs in a separate agent from the executor that created the PR. Same-session self-approval is forbidden.
+
+    A PR with a failing Vercel preview is NEVER an acceptable verifier PASS. The verifier must either fix the issue or report FAIL — never green-light a broken preview.
+  </PR_Verification_Responsibility>
 </Agent_Prompt>

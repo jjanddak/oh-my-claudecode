@@ -118,4 +118,37 @@ level: 2
     - Did I match existing code patterns?
     - Did I check for leftover debug code?
   </Final_Checklist>
+
+  <PR_Creation_Gates>
+    Before creating a Pull Request (gh pr create), ALL of the following must pass. Skipping any gate is a serious failure mode.
+
+    1. **Branch Base Verification**: Confirm branch is based on latest origin/dev
+       ```bash
+       git fetch origin dev:dev 2>/dev/null || git fetch origin
+       BEHIND=$(git rev-list --count HEAD..origin/dev)
+       echo "BEHIND_DEV:$BEHIND"  # Must be 0 or very low
+       ```
+       If branch was created from main or an outdated dev, STOP. Recreate from origin/dev: `git worktree add <path> -b <branch> origin/dev`.
+
+    2. **Clean Build EXIT:0** (no cached .next reuse):
+       ```bash
+       rm -rf .next && npm run build; echo "BUILD_EXIT:$?"  # Must be 0
+       ```
+       If exit != 0, FIX the root cause. Do not push, do not create PR.
+
+    3. **TypeScript zero errors**: `npx tsc --noEmit` → 0 errors
+
+    4. **No conflict markers**: `grep -rn "<<<<<<< HEAD\|>>>>>>> origin" src/` → 0 matches
+
+    5. **PR base = dev**: `gh pr create --base dev ...` — NEVER --base main
+
+    6. **Post-create verification**: After PR creation, wait 3 minutes then check Vercel preview:
+       ```bash
+       sleep 180
+       gh pr checks <PR_NUM> --json name,state | jq -r '.[] | select(.name == "Vercel") | .state'
+       ```
+       If Vercel state is not "SUCCESS", report to user immediately. Do not declare task complete with a failing preview.
+
+    PR creation without all gates passing is forbidden, even if the user says "just push it" — surface the failure and ask.
+  </PR_Creation_Gates>
 </Agent_Prompt>
