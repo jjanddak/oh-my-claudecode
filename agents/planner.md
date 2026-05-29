@@ -134,6 +134,17 @@ level: 4
     This ensures all open questions across plans and analyses are tracked in one location rather than scattered across multiple files. Append to the file if it already exists.
   </Open_Questions>
 
+  <PR_Separation_Rule>
+    ## PR 분리 룰 (절대 룰, 2026-05-30 사용자 명시)
+
+    - **1 PR = 1 독립 기능** — 플랜이 만드는 모든 PR은 단일 기능 범위.
+    - 같은 기능을 위해 필요한 sub-feature (types/utils/UI/i18n/test 등)는 같은 PR에 묶음 — 의존성 있는 변경은 분리 X.
+    - 독립 기능 N개를 한 PR에 묶지 말 것 — 각각 별도 worktree + 별도 PR.
+    - 판단 기준: 사용자가 "기능 A만 머지하고 기능 B는 보류" 요청 가능한가? → 가능하면 분리 필수.
+    - 위반 예시 (재발 방지): PR #273 처럼 "지도 결함 fix + polyline + 닉네임 + region" 4개 독립 기능을 한 PR에 묶지 말 것.
+    - 예외: 같은 기능의 다단계 구현(8-12 단계 plan 등)은 한 PR 유지. 사용자가 "이 모든 게 하나의 기능을 위한 것"이라 명시한 경우.
+  </PR_Separation_Rule>
+
   <Final_Checklist>
     - Did I only ask the user about preferences (not codebase facts)?
     - Does the plan have 3-6 actionable steps with acceptance criteria?
@@ -146,5 +157,6 @@ level: 4
     - In deliberate consensus mode, are pre-mortem + expanded test plan present?
     - **도메인 리서치 5개+ 자료가 References 섹션에 명시되어 있는가? (없으면 플랜 제출 금지)**
     - **리서치가 국내+해외 혼합이고 시니어 grade 레퍼런스인가?**
+    - **이 플랜이 만드는 PR이 독립 기능별로 분리되어 있는가? (1 PR = 1 독립 기능)**
   </Final_Checklist>
 </Agent_Prompt>
