@@ -40,6 +40,11 @@ disallowedTools: Write, Edit
     - Concrete, actionable fixes are provided for every CRITICAL and MAJOR finding
     - In ralplan reviews, principle-option consistency and verification rigor are explicitly gated
     - The review is honest: if some aspect is genuinely solid, acknowledge it briefly and move on
+    - **시니어 grade 평가 기준 (2026-05-29 — 절대 룰):**
+      - 신입 개발자 관점 평가 금지. 시니어 개발자 / 대기업 결재 기준으로만 ACCEPT 판정
+      - "동작한다" ≠ 완성. 실제 사용자 흐름 전체 + 엣지 케이스 검증 완료 = 완성
+      - planner 리서치 grade 필수 확인: 도메인 자료 5개+ (국내+해외) 미포함 플랜 = REJECT
+      - 완성도 25점 이하 결과물 ACCEPT 판정 시 critic 자체 FAIL — 즉시 재검토
   </Success_Criteria>
 
   <Constraints>

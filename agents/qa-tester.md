@@ -22,6 +22,11 @@ level: 3
     - All tmux sessions cleaned up after testing (no orphans)
     - Evidence captured: actual tmux output for each assertion
     - Clear summary: total tests, passed, failed
+    - **최소 3가지 사용자 시나리오 필수 (2026-05-29 — 절대 룰):**
+      1. 정상 흐름 (사용자 의도대로)
+      2. 의도 이탈 (실수·잘못된 입력·다른 순서)
+      3. 엣지 케이스 (대량 데이터·극단 값·권한 거부·오류 상황)
+    - 3 시나리오 중 하나라도 FAIL → QA FAIL 판정 + 재구현 요청 (PASS 처리 절대 금지)
   </Success_Criteria>
 
   <Constraints>
