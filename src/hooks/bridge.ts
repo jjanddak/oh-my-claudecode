@@ -229,6 +229,9 @@ function buildSessionStartAdditionalContext(messages: string[]): string {
 }
 
 function readLinuxBootId(): string | undefined {
+  const testBootId = process.env.OMC_TEST_BOOT_ID?.trim();
+  if (testBootId) return testBootId;
+
   try {
     if (!existsSync(LINUX_BOOT_ID_PATH)) return undefined;
     const bootId = readFileSync(LINUX_BOOT_ID_PATH, "utf-8").trim();
@@ -1229,7 +1232,7 @@ function getPromptText(input: HookInput): string {
 }
 
 function isExplicitAskSlashInvocation(promptText: string): boolean {
-  return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini)\b/i.test(promptText);
+  return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|grok)\b/i.test(promptText);
 }
 
 function activateRalplanStartupState(directory: string, sessionId?: string): void {
@@ -2168,6 +2171,70 @@ The CLAUDE.md instruction "Pass model on Task calls: haiku, sonnet, opus" applie
   return { continue: true };
 }
 
+type AskUserQuestionToolOption = {
+  label?: unknown;
+  value?: unknown;
+  description?: unknown;
+};
+
+type AskUserQuestionToolPrompt = {
+  question?: unknown;
+  header?: unknown;
+  options?: AskUserQuestionToolOption[];
+  allow_other?: unknown;
+  allowOther?: unknown;
+  other_label?: unknown;
+  otherLabel?: unknown;
+  multiSelect?: unknown;
+  multi_select?: unknown;
+};
+
+function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+export function extractAskUserQuestionPrompts(toolInput: unknown) {
+  const input = toolInput as { questions?: AskUserQuestionToolPrompt[] } | undefined;
+  const questions = Array.isArray(input?.questions) ? input.questions : [];
+
+  return questions
+    .map((question) => {
+      const questionText = stringOrUndefined(question.question);
+      if (!questionText) return null;
+
+      const rawOptions = Array.isArray(question.options) ? question.options : [];
+      const options = rawOptions
+        .map((option) => {
+          const label = stringOrUndefined(option.label);
+          if (!label) return null;
+          const value = stringOrUndefined(option.value);
+          const description = stringOrUndefined(option.description);
+          return {
+            label,
+            ...(value ? { value } : {}),
+            ...(description ? { description } : {}),
+          };
+        })
+        .filter((option): option is { label: string; value?: string; description?: string } => option !== null);
+
+      const allowOther = question.allowOther ?? question.allow_other;
+      const otherLabel = stringOrUndefined(question.otherLabel ?? question.other_label);
+      const multiSelect = question.multiSelect ?? question.multi_select;
+
+      const header = stringOrUndefined(question.header);
+
+      return {
+        question: questionText,
+        ...(header ? { header } : {}),
+        options,
+        allowOther: allowOther === false ? false : true,
+        otherLabel: otherLabel ?? "Other",
+        multiSelect: multiSelect === true,
+      };
+    })
+    .filter((question): question is NonNullable<typeof question> => question !== null);
+}
+
 /**
  * Fire-and-forget notification for AskUserQuestion (issue #597).
  * Extracted for testability; the dynamic import makes direct assertion
@@ -2178,13 +2245,10 @@ export function dispatchAskUserQuestionNotification(
   directory: string,
   toolInput: unknown,
 ): void {
-  const input = toolInput as
-    | { questions?: Array<{ question?: string }> }
-    | undefined;
-  const questions = input?.questions || [];
+  const prompts = extractAskUserQuestionPrompts(toolInput);
   const questionText =
-    questions
-      .map((q) => q.question || "")
+    prompts
+      .map((q) => q.question)
       .filter(Boolean)
       .join("; ") || "User input requested";
 
@@ -2192,6 +2256,7 @@ export function dispatchAskUserQuestionNotification(
     sessionId,
     projectPath: directory,
     question: questionText,
+    askUserQuestionPrompts: prompts,
     profileName: process.env.OMC_NOTIFY_PROFILE,
   });
 }
@@ -3173,11 +3238,7 @@ export async function processHook(
 
       case "code-simplifier": {
         const directory = input.directory ?? process.cwd();
-        const stateDir = join(
-          resolveToWorktreeRoot(directory),
-          ".omc",
-          "state",
-        );
+        const stateDir = join(getOmcRoot(directory), "state");
         const { processCodeSimplifier } =
           await import("./code-simplifier/index.js");
         const result = processCodeSimplifier(directory, stateDir);

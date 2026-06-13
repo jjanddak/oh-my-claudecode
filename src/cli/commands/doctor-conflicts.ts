@@ -10,6 +10,18 @@ import { isOmcHook } from '../../installer/index.js';
 import { colors } from '../utils/formatting.js';
 import { getSkillsDir, listBuiltinSkillNames } from '../../features/builtin-skills/skills.js';
 import { inspectUnifiedMcpRegistrySync } from '../../installer/mcp-registry.js';
+import { findWorkspaceRoot, WORKSPACE_MARKER } from '../../lib/worktree-paths.js';
+
+export interface WorkspaceMarkerStatus {
+  /** Absolute path to the directory containing .omc-workspace, or null if absent. */
+  markerRoot: string | null;
+  /** True when OMC_STATE_DIR env var is set. */
+  stateDirEnvSet: boolean;
+  /** Value of OMC_STATE_DIR, or null when unset. */
+  stateDirEnvValue: string | null;
+  /** When both OMC_STATE_DIR and .omc-workspace are active, this is true (warn: OMC_STATE_DIR wins). */
+  precedenceConflict: boolean;
+}
 
 export interface ConflictReport {
   hookConflicts: { event: string; command: string; isOmc: boolean }[];
@@ -17,7 +29,9 @@ export interface ConflictReport {
   legacySkills: { name: string; path: string }[];
   envFlags: { disableOmc: boolean; skipHooks: string[] };
   configIssues: { unknownFields: string[] };
+  windowsUnsafePluginHooks: { pluginRoot: string; event: string; command: string }[];
   mcpRegistrySync: ReturnType<typeof inspectUnifiedMcpRegistrySync>;
+  workspaceMarker: WorkspaceMarkerStatus;
   hasConflicts: boolean;
 }
 
@@ -92,6 +106,57 @@ export function checkHookConflicts(): ConflictReport['hookConflicts'] {
   }
 
   return merged;
+}
+
+function isWindowsUnsafePluginHookCommand(command: string): boolean {
+  return command.includes('find-node.sh')
+    || command.includes('/bin/sh')
+    || /^sh\s/.test(command);
+}
+
+/**
+ * Native Windows cannot execute plugin hooks that still route through sh/find-node.
+ * Detect stale cache manifests so doctor can point users at setup/update repair
+ * instead of reporting a generic hook conflict.
+ */
+export function checkWindowsUnsafePluginHooks(): ConflictReport['windowsUnsafePluginHooks'] {
+  if (process.platform !== 'win32') {
+    return [];
+  }
+
+  const roots = [process.env.CLAUDE_PLUGIN_ROOT, ...readInstalledPluginRoots()]
+    .filter((root): root is string => typeof root === 'string' && root.length > 0);
+  const seenRoots = new Set<string>();
+  const unsafe: ConflictReport['windowsUnsafePluginHooks'] = [];
+
+  for (const pluginRoot of roots) {
+    if (seenRoots.has(pluginRoot)) continue;
+    seenRoots.add(pluginRoot);
+
+    const hooksJsonPath = join(pluginRoot, 'hooks', 'hooks.json');
+    if (!existsSync(hooksJsonPath)) continue;
+
+    try {
+      const parsed = JSON.parse(readFileSync(hooksJsonPath, 'utf-8')) as {
+        hooks?: Record<string, Array<{ hooks?: Array<{ type?: string; command?: string }> }>>;
+      };
+
+      for (const [event, groups] of Object.entries(parsed.hooks ?? {})) {
+        for (const group of groups) {
+          for (const hook of group.hooks ?? []) {
+            if (hook.type !== 'command' || typeof hook.command !== 'string') continue;
+            if (isWindowsUnsafePluginHookCommand(hook.command)) {
+              unsafe.push({ pluginRoot, event, command: hook.command });
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore unreadable manifests; doctor should remain best-effort.
+    }
+  }
+
+  return unsafe;
 }
 
 /**
@@ -450,6 +515,26 @@ export function checkConfigIssues(): ConflictReport['configIssues'] {
 }
 
 /**
+ * Check for .omc-workspace marker presence and OMC_STATE_DIR precedence.
+ *
+ * Reports:
+ *  - Whether a .omc-workspace marker was found (and where).
+ *  - Whether OMC_STATE_DIR is set.
+ *  - When both are set, emits a precedenceConflict flag (OMC_STATE_DIR wins per
+ *    the resolution-order principle: OMC_STATE_DIR > .omc-workspace > git > cwd).
+ */
+export function checkWorkspaceMarker(): WorkspaceMarkerStatus {
+  const markerRoot = findWorkspaceRoot();
+  const stateDirEnvValue = process.env.OMC_STATE_DIR && process.env.OMC_STATE_DIR.trim()
+    ? process.env.OMC_STATE_DIR.trim()
+    : null;
+  const stateDirEnvSet = stateDirEnvValue !== null;
+  const precedenceConflict = stateDirEnvSet && markerRoot !== null;
+
+  return { markerRoot, stateDirEnvSet, stateDirEnvValue, precedenceConflict };
+}
+
+/**
  * Run complete conflict check
  */
 export function runConflictCheck(): ConflictReport {
@@ -458,7 +543,9 @@ export function runConflictCheck(): ConflictReport {
   const legacySkills = checkLegacySkills();
   const envFlags = checkEnvFlags();
   const configIssues = checkConfigIssues();
+  const windowsUnsafePluginHooks = checkWindowsUnsafePluginHooks();
   const mcpRegistrySync = inspectUnifiedMcpRegistrySync();
+  const workspaceMarker = checkWorkspaceMarker();
 
   // Determine if there are actual conflicts
   const hasConflicts =
@@ -467,11 +554,13 @@ export function runConflictCheck(): ConflictReport {
     envFlags.disableOmc || // OMC is disabled
     envFlags.skipHooks.length > 0 || // Hooks are being skipped
     configIssues.unknownFields.length > 0 || // Unknown config fields
+    windowsUnsafePluginHooks.length > 0 || // Stale plugin hooks still use sh/find-node on Windows
     mcpRegistrySync.claudeMissing.length > 0 ||
     mcpRegistrySync.claudeMismatched.length > 0 ||
     mcpRegistrySync.codexMissing.length > 0 ||
     mcpRegistrySync.codexMismatched.length > 0;
     // Note: Missing OMC markers is informational (normal for fresh install), not a conflict
+    // Note: workspaceMarker.precedenceConflict is a WARN, not a hard conflict
 
   return {
     hookConflicts,
@@ -479,7 +568,9 @@ export function runConflictCheck(): ConflictReport {
     legacySkills,
     envFlags,
     configIssues,
+    windowsUnsafePluginHooks,
     mcpRegistrySync,
+    workspaceMarker,
     hasConflicts
   };
 }
@@ -574,6 +665,19 @@ export function formatReport(report: ConflictReport, json: boolean): string {
     lines.push('');
   }
 
+  // Windows plugin hook portability
+  if (report.windowsUnsafePluginHooks.length > 0) {
+    lines.push(colors.bold('🪟 Windows Plugin Hooks'));
+    lines.push('');
+    lines.push(`  ${colors.yellow('⚠')} Plugin hooks still route through sh/find-node on native Windows:`);
+    for (const hook of report.windowsUnsafePluginHooks) {
+      lines.push(`    - ${hook.event} ${colors.gray(`(${hook.pluginRoot})`)}`);
+      lines.push(`      ${colors.gray(hook.command)}`);
+    }
+    lines.push(`    ${colors.gray('Run /oh-my-claudecode:omc-setup or update/reinstall the plugin to rewrite hooks to direct node run.cjs commands.')}`);
+    lines.push('');
+  }
+
   // Config issues
   if (report.configIssues.unknownFields.length > 0) {
     lines.push(colors.bold('⚙️  Configuration Issues'));
@@ -615,6 +719,28 @@ export function formatReport(report: ConflictReport, json: boolean): string {
     } else {
       lines.push(`  ${colors.green('✓')} Codex config.toml is in sync`);
     }
+  }
+  lines.push('');
+
+  // Workspace marker
+  lines.push(colors.bold('🗂  Workspace Marker (.omc-workspace)'));
+  lines.push('');
+  const wm = report.workspaceMarker;
+  if (wm.markerRoot) {
+    lines.push(`  ${colors.green('✓')} ${WORKSPACE_MARKER} found`);
+    lines.push(`    ${colors.gray(`Marker root: ${wm.markerRoot}`)}`);
+  } else {
+    lines.push(`  ${colors.gray('ℹ')} No ${WORKSPACE_MARKER} marker found (single-repo mode)`);
+  }
+  if (wm.stateDirEnvSet) {
+    lines.push(`  ${colors.green('✓')} OMC_STATE_DIR is set: ${wm.stateDirEnvValue}`);
+  } else {
+    lines.push(`  ${colors.gray('ℹ')} OMC_STATE_DIR not set`);
+  }
+  if (wm.precedenceConflict) {
+    lines.push(`  ${colors.yellow('⚠')} Both OMC_STATE_DIR and ${WORKSPACE_MARKER} are active.`);
+    lines.push(`    ${colors.gray('OMC_STATE_DIR takes precedence (resolution order: OMC_STATE_DIR > .omc-workspace > git > cwd).')}`);
+    lines.push(`    ${colors.gray('If you intended .omc-workspace to anchor state, unset OMC_STATE_DIR.')}`);
   }
   lines.push('');
 

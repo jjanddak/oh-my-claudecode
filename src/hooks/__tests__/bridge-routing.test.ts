@@ -863,6 +863,27 @@ $ ultrawork search the codebase`,
       }
     });
 
+    it('does not arm ralplan state for keywords inside delegated /ask grok prompts', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-ask-grok-'));
+      try {
+        execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+        const sessionId = 'ask-grok-session';
+
+        const result = await processHook('keyword-detector', {
+          sessionId,
+          prompt: '/ask grok 지금까지 논의한걸 ralplan으로 계획서 작성해줘',
+          directory: tempDir,
+        });
+
+        expect(result.continue).toBe(true);
+        expect(result.message).toBeUndefined();
+        expect((result as unknown as Record<string, unknown>).hookSpecificOutput).toBeUndefined();
+        expect(existsSync(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'ralplan-state.json'))).toBe(false);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it('activates ralplan state when Skill tool invokes plan in consensus mode', async () => {
       const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-plan-consensus-skill-'));
       try {
@@ -1151,10 +1172,17 @@ $ ultrawork search the codebase`,
           }),
         );
 
+        const previousTestBootId = process.env.OMC_TEST_BOOT_ID;
+        process.env.OMC_TEST_BOOT_ID = 'current-test-boot-id';
         const result = await processHook('session-start', {
           sessionId: currentSessionId,
           directory: tempDir,
         } as HookInput);
+        if (previousTestBootId === undefined) {
+          delete process.env.OMC_TEST_BOOT_ID;
+        } else {
+          process.env.OMC_TEST_BOOT_ID = previousTestBootId;
+        }
 
         expect(result.continue).toBe(true);
         expect(existsSync(join(staleSessionDir, 'ralph-state.json'))).toBe(false);
@@ -2079,7 +2107,7 @@ $ ultrawork search the codebase`,
 
         flushPendingWrites();
 
-        const trackingPath = join(tempDir, '.omc', 'state', 'subagent-tracking.json');
+        const trackingPath = join(tempDir, '.omc', 'state', 'sessions', 'test-session-858-subagent', 'subagent-tracking-state.json');
         expect(existsSync(trackingPath)).toBe(true);
 
         const tracking = JSON.parse(readFileSync(trackingPath, 'utf-8')) as {

@@ -21,6 +21,7 @@ import { existsSync } from 'fs';
 import { mkdir, readdir, readFile, rm, writeFile } from 'fs/promises';
 import { performance } from 'perf_hooks';
 import { TeamPaths, absPath, teamStateRoot } from './state-paths.js';
+import { getOmcRoot } from '../lib/worktree-paths.js';
 import { allocateTasksToWorkers } from './allocation-policy.js';
 import { readTeamConfig, readWorkerStatus, readWorkerHeartbeat, readMonitorSnapshot, writeMonitorSnapshot, writeShutdownRequest, readShutdownAck, writeWorkerInbox, listTasksFromFiles, saveTeamConfig, cleanupTeamState, } from './monitor.js';
 import { appendTeamEvent, emitMonitorDerivedEvents } from './events.js';
@@ -28,7 +29,7 @@ import { DEFAULT_TEAM_GOVERNANCE, DEFAULT_TEAM_TRANSPORT_POLICY, getConfigGovern
 import { inferPhase } from './phase-controller.js';
 import { validateTeamName } from './team-name.js';
 import { buildWorkerArgv, getContract, resolveValidatedBinaryPath, getWorkerEnv as getModelWorkerEnv, isPromptModeAgent, getPromptModeArgs, resolveClaudeWorkerModel, } from './model-contract.js';
-import { createTeamSession, spawnWorkerInPane, sendToWorker, killTeamSession, waitForPaneReady, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, getWorkerLiveness, } from './tmux-session.js';
+import { createTeamSession, spawnWorkerInPane, sendToWorker, killTeamSession, waitForPaneReady, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, getWorkerLiveness, captureTeamPane, sendTeamPaneKey, } from './tmux-session.js';
 import { composeInitialInbox, ensureWorkerStateDir, writeWorkerOverlay, generateTriggerMessage, generatePromptModeStartupPrompt, } from './worker-bootstrap.js';
 import { queueInboxInstruction } from './mcp-comm.js';
 import { cleanupTeamWorktrees, inspectTeamWorktreeCleanupSafety, ensureWorkerWorktree, installWorktreeRootAgents, normalizeTeamWorktreeMode, } from './git-worktree.js';
@@ -186,13 +187,7 @@ async function getWorkerPaneLiveness(paneId) {
 async function captureWorkerPane(paneId) {
     if (!paneId)
         return '';
-    try {
-        const result = await tmuxExecAsync(['capture-pane', '-t', paneId, '-p', '-S', '-80']);
-        return result.stdout ?? '';
-    }
-    catch {
-        return '';
-    }
+    return captureTeamPane(paneId);
 }
 function isFreshTimestamp(value, maxAgeMs = MONITOR_SIGNAL_STALE_MS) {
     if (!value)
@@ -377,6 +372,11 @@ async function spawnV2Worker(opts) {
                 || process.env.OMC_GEMINI_DEFAULT_MODEL
                 || undefined;
         }
+        if (opts.agentType === 'grok') {
+            return process.env.OMC_EXTERNAL_MODELS_DEFAULT_GROK_MODEL
+                || process.env.OMC_GROK_DEFAULT_MODEL
+                || undefined;
+        }
         // Claude agents: resolve Bedrock/Vertex model when on those providers
         return resolveClaudeWorkerModel();
     })();
@@ -465,7 +465,23 @@ async function spawnV2Worker(opts) {
         };
     }
     if (opts.agentType === 'claude') {
-        const settled = await waitForWorkerStartupEvidence(opts.teamName, opts.workerName, opts.taskId, opts.cwd, 6);
+        let settled = await waitForWorkerStartupEvidence(opts.teamName, opts.workerName, opts.taskId, opts.cwd, 6);
+        // Claude Code v2.1.x sometimes swallows the Enter key sent immediately
+        // after a fresh pane reports ready — the TUI is still binding input
+        // handlers, so the dispatch message lands in the input buffer but is
+        // never submitted. By the time the evidence wait above finishes, the
+        // TUI is reliably accepting input. Resubmit Enter directly (the prompt
+        // is still sitting in the input buffer) and re-check evidence. Bounded
+        // retries so a truly hung worker still fails fast.
+        for (let attempt = 1; !settled && attempt <= 4; attempt++) {
+            try {
+                await sendTeamPaneKey(paneId, 'Enter');
+            }
+            catch {
+                break;
+            }
+            settled = await waitForWorkerStartupEvidence(opts.teamName, opts.workerName, opts.taskId, opts.cwd, 12);
+        }
         if (!settled) {
             return {
                 paneId,
@@ -615,7 +631,7 @@ export async function startTeamV2(config) {
     // Create state directories
     await mkdir(absPath(leaderCwd, TeamPaths.tasks(sanitized)), { recursive: true });
     await mkdir(absPath(leaderCwd, TeamPaths.workers(sanitized)), { recursive: true });
-    await mkdir(join(leaderCwd, '.omc', 'state', 'team', sanitized, 'mailbox'), { recursive: true });
+    await mkdir(join(getOmcRoot(leaderCwd), 'state', 'team', sanitized, 'mailbox'), { recursive: true });
     // AC-8: emit a loud team-event warning naming every missing/untrusted CLI
     // binary so the leader surfaces the fallback decision instead of silently
     // swapping providers.
@@ -1730,7 +1746,7 @@ export async function resumeTeamV2(teamName, cwd) {
 // findActiveTeams — discover running teams
 // ---------------------------------------------------------------------------
 export async function findActiveTeamsV2(cwd) {
-    const root = join(cwd, '.omc', 'state', 'team');
+    const root = join(getOmcRoot(cwd), 'state', 'team');
     if (!existsSync(root))
         return [];
     const entries = await readdir(root, { withFileTypes: true });

@@ -22,6 +22,7 @@ import { existsSync } from 'fs';
 import { mkdir, readdir, readFile, rm, writeFile } from 'fs/promises';
 import { performance } from 'perf_hooks';
 import { TeamPaths, absPath, teamStateRoot } from './state-paths.js';
+import { getOmcRoot } from '../lib/worktree-paths.js';
 import { allocateTasksToWorkers } from './allocation-policy.js';
 import type { TaskAllocationInput, WorkerAllocationInput } from './allocation-policy.js';
 import {
@@ -63,7 +64,7 @@ import {
 } from './model-contract.js';
 import {
   createTeamSession, spawnWorkerInPane, sendToWorker, killTeamSession,
-  waitForPaneReady, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, getWorkerLiveness, type WorkerPaneConfig, type WorkerPaneLiveness, type TeamSessionMode,
+  waitForPaneReady, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, getWorkerLiveness, captureTeamPane, sendTeamPaneKey, type WorkerPaneConfig, type WorkerPaneLiveness, type TeamSessionMode,
 } from './tmux-session.js';
 import {
   composeInitialInbox,
@@ -349,12 +350,7 @@ async function getWorkerPaneLiveness(paneId: string | undefined): Promise<Worker
 
 async function captureWorkerPane(paneId: string | undefined): Promise<string> {
   if (!paneId) return '';
-  try {
-    const result = await tmuxExecAsync(['capture-pane', '-t', paneId, '-p', '-S', '-80']);
-    return result.stdout ?? '';
-  } catch {
-    return '';
-  }
+  return captureTeamPane(paneId);
 }
 
 function isFreshTimestamp(value: string | undefined, maxAgeMs: number = MONITOR_SIGNAL_STALE_MS): boolean {
@@ -681,6 +677,11 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
         || process.env.OMC_GEMINI_DEFAULT_MODEL
         || undefined;
     }
+    if (opts.agentType === 'grok') {
+      return process.env.OMC_EXTERNAL_MODELS_DEFAULT_GROK_MODEL
+        || process.env.OMC_GROK_DEFAULT_MODEL
+        || undefined;
+    }
     // Claude agents: resolve Bedrock/Vertex model when on those providers
     return resolveClaudeWorkerModel();
   })();
@@ -778,13 +779,34 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
   }
 
   if (opts.agentType === 'claude') {
-    const settled = await waitForWorkerStartupEvidence(
+    let settled = await waitForWorkerStartupEvidence(
       opts.teamName,
       opts.workerName,
       opts.taskId,
       opts.cwd,
       6,
     );
+    // Claude Code v2.1.x sometimes swallows the Enter key sent immediately
+    // after a fresh pane reports ready — the TUI is still binding input
+    // handlers, so the dispatch message lands in the input buffer but is
+    // never submitted. By the time the evidence wait above finishes, the
+    // TUI is reliably accepting input. Resubmit Enter directly (the prompt
+    // is still sitting in the input buffer) and re-check evidence. Bounded
+    // retries so a truly hung worker still fails fast.
+    for (let attempt = 1; !settled && attempt <= 4; attempt++) {
+      try {
+        await sendTeamPaneKey(paneId, 'Enter');
+      } catch {
+        break;
+      }
+      settled = await waitForWorkerStartupEvidence(
+        opts.teamName,
+        opts.workerName,
+        opts.taskId,
+        opts.cwd,
+        12,
+      );
+    }
     if (!settled) {
       return {
         paneId,
@@ -961,7 +983,7 @@ export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntim
   // Create state directories
   await mkdir(absPath(leaderCwd, TeamPaths.tasks(sanitized)), { recursive: true });
   await mkdir(absPath(leaderCwd, TeamPaths.workers(sanitized)), { recursive: true });
-  await mkdir(join(leaderCwd, '.omc', 'state', 'team', sanitized, 'mailbox'), { recursive: true });
+  await mkdir(join(getOmcRoot(leaderCwd), 'state', 'team', sanitized, 'mailbox'), { recursive: true });
 
   // AC-8: emit a loud team-event warning naming every missing/untrusted CLI
   // binary so the leader surfaces the fallback decision instead of silently
@@ -2216,7 +2238,7 @@ export async function resumeTeamV2(
 // ---------------------------------------------------------------------------
 
 export async function findActiveTeamsV2(cwd: string): Promise<string[]> {
-  const root = join(cwd, '.omc', 'state', 'team');
+  const root = join(getOmcRoot(cwd), 'state', 'team');
   if (!existsSync(root)) return [];
   const entries = await readdir(root, { withFileTypes: true });
   const active: string[] = [];

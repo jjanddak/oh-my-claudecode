@@ -299,6 +299,14 @@ const RALPLAN_TERMINAL_PHASES = new Set([
   "terminated",
   "done",
   "handoff",
+  "pending approval",
+  "pending-approval",
+  "pending_approval",
+  "awaiting approval",
+  "awaiting-approval",
+  "awaiting_approval",
+  "approval-required",
+  "approval_required",
 ]);
 const TEAM_ACTIVE_PHASES = new Set([
   "team-plan",
@@ -750,7 +758,7 @@ function countIncompleteTasks(sessionId) {
   return count;
 }
 
-function countIncompleteTodos(sessionId, projectDir) {
+async function countIncompleteTodos(sessionId, projectDir) {
   let count = 0;
 
   // Session-specific todos only (no global scan)
@@ -780,8 +788,9 @@ function countIncompleteTodos(sessionId, projectDir) {
   }
 
   // Project-local todos only
+  const omcRoot = await resolveOmcStateRoot(projectDir);
   for (const path of [
-    join(projectDir, ".omc", "todos.json"),
+    join(omcRoot, "todos.json"),
     join(projectDir, ".claude", "todos.json"),
   ]) {
     try {
@@ -1057,7 +1066,7 @@ async function main() {
 
     // Count incomplete items (session-specific + project-local only)
     const taskCount = countIncompleteTasks(sessionId);
-    const todoCount = countIncompleteTodos(sessionId, directory);
+    const todoCount = await countIncompleteTodos(sessionId, directory);
     const totalIncomplete = taskCount + todoCount;
 
     // Check if cancel is in progress - if so, allow stop immediately
@@ -1235,7 +1244,7 @@ async function main() {
 
           sendStopNotification("ralplan", ralplan.state, sessionId, directory).catch(() => {});
 
-          const ralplanReason = `[RALPLAN - CONSENSUS PLANNING | REINFORCEMENT ${breakerCount}/${RALPLAN_STOP_BLOCKER_MAX}] The ralplan consensus workflow is active. Continue the Planner/Architect/Critic loop. Do not stop until consensus is reached or the workflow completes. When done, run /oh-my-claudecode:cancel to cleanly exit.`;
+          const ralplanReason = `[RALPLAN - CONSENSUS PLANNING | REINFORCEMENT ${breakerCount}/${RALPLAN_STOP_BLOCKER_MAX}] The ralplan consensus workflow is active. Continue the Planner/Architect/Critic planning loop only. Ralplan is read-only/planning mode: do not implement, invoke execution skills, edit source, commit, push, or open PRs from this continuation. When consensus is reached, stop at a pending-approval handoff and require explicit user approval before execution. When done, run /oh-my-claudecode:cancel to cleanly exit.`;
           console.log(JSON.stringify({
             decision: "block",
             reason: ralplanReason,
