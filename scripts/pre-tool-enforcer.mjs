@@ -8,15 +8,17 @@
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'fs';
 import { createHash } from 'crypto';
-import { dirname, join, resolve } from 'path';
+import { dirname, join, resolve, basename } from 'path';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { getClaudeConfigDir } from './lib/config-dir.mjs';
+import { encodeProjectPath } from './lib/encode-project-path.mjs';
 import { evaluateAgentHeavyPreflight } from './lib/pre-tool-enforcer-preflight.mjs';
 import { evaluateForceAgentDelegation } from './lib/force-agent-delegation-preflight.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
 import { readStdin } from './lib/stdin.mjs';
+import { resolveConfiguredAgentModel } from './lib/agent-model-config.mjs';
 
 // Inlined from src/config/models.ts — avoids a dist/ import so the hook works
 // before a build and stays consistent with the TypeScript source.
@@ -79,7 +81,7 @@ function acceptsProxyAnthropicDefaultTierValue(key, value) {
     && !isBedrockProviderEnv()
     && !isVertexProviderEnv();
 }
-const TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku']);
+const TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'fable']);
 function isTierAlias(modelId) {
   return TIER_ALIASES.has((modelId || '').toLowerCase());
 }
@@ -95,6 +97,7 @@ const TIER_TO_DEFAULT_ENV_KEYS = {
   haiku:  ['OMC_SUBAGENT_MODEL', 'CLAUDE_CODE_BEDROCK_HAIKU_MODEL',  'ANTHROPIC_DEFAULT_HAIKU_MODEL'],
   sonnet: ['OMC_SUBAGENT_MODEL', 'CLAUDE_CODE_BEDROCK_SONNET_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL'],
   opus:   ['OMC_SUBAGENT_MODEL', 'CLAUDE_CODE_BEDROCK_OPUS_MODEL',   'ANTHROPIC_DEFAULT_OPUS_MODEL'],
+  fable:  ['OMC_SUBAGENT_MODEL', 'CLAUDE_CODE_BEDROCK_FABLE_MODEL',  'ANTHROPIC_DEFAULT_FABLE_MODEL'],
 };
 function resolveTierAliasToSafeModel(tierAlias) {
   const keys = TIER_TO_DEFAULT_ENV_KEYS[(tierAlias || '').toLowerCase()];
@@ -112,13 +115,14 @@ function resolveTierAliasToSafeModel(tierAlias) {
   }
   return '';
 }
-/** Map a bare Anthropic model ID to its CC tier alias (sonnet/opus/haiku), or null if unrecognised. */
+/** Map a bare Anthropic model ID to its CC tier alias (sonnet/opus/haiku/fable), or null if unrecognised. */
 function normalizeToCcAlias(model) {
   if (!model) return null;
   const lower = model.toLowerCase();
   if (lower.includes('opus'))   return 'opus';
   if (lower.includes('sonnet')) return 'sonnet';
   if (lower.includes('haiku'))  return 'haiku';
+  if (lower.includes('fable'))  return 'fable';
   return null;
 }
 /**
@@ -524,13 +528,12 @@ function resolveTranscriptPath(transcriptPath, cwd) {
     }).trim();
 
     if (mainRepoRoot !== worktreeTop) {
-      const lastSep = transcriptPath.lastIndexOf('/');
-      const sessionFile = lastSep !== -1 ? transcriptPath.substring(lastSep + 1) : '';
+      const sessionFile = basename(transcriptPath);
       if (sessionFile) {
         const configDir = getClaudeConfigDir();
         const projectsDir = join(configDir, 'projects');
         if (existsSync(projectsDir)) {
-          const encodedMain = mainRepoRoot.replace(/[/\\]/g, '-');
+          const encodedMain = encodeProjectPath(mainRepoRoot);
           const resolvedPath = join(projectsDir, encodedMain, sessionFile);
           try {
             if (existsSync(resolvedPath)) return resolvedPath;
@@ -736,6 +739,29 @@ function extractClaudeGoalSnapshot(data) {
 }
 
 
+function isCancelSkillBootstrapTool(toolName, toolInput) {
+  const skillName = extractSkillName(toolInput);
+  if (toolName === 'Skill' && skillName === 'cancel') return true;
+  if (toolName === 'ToolSearch') return true;
+
+  if (toolName === 'Read') {
+    const filePath = typeof toolInput.file_path === 'string'
+      ? toolInput.file_path
+      : typeof toolInput.path === 'string'
+        ? toolInput.path
+        : '';
+    const normalized = filePath.replace(/\\/g, '/');
+    if (/(?:^|\/)(?:skills|skill-bodies)\/cancel\/SKILL\.md$/i.test(normalized)) return true;
+  }
+
+  if (/state_(?:clear|read|write|list_active|get_status)$/i.test(toolName)) return true;
+  if (/^mcp__.*__state_(?:clear|read|write|list_active|get_status)$/i.test(toolName)) return true;
+
+  if (toolName !== 'Bash') return false;
+  const command = typeof toolInput.command === 'string' ? toolInput.command : '';
+  return /(?:^|[;&|\s])(?:omc|oh-my-claudecode|gjc)\s+(?:state\s+(?:clear|read|write|list-active|get-status)|cancel)\b/.test(command);
+}
+
 function isUltragoalBootstrapTool(toolName, toolInput) {
   if (toolName === 'Skill' && extractSkillName(toolInput) === 'ultragoal') return true;
   if (toolName !== 'Bash') return false;
@@ -748,6 +774,7 @@ function evaluateUltragoalPreToolEnforcement(stateDir, directory, sessionId, dat
   const toolName = data.tool_name || data.toolName || '';
   const toolInput = data.toolInput || data.tool_input || {};
   if (isUltragoalBootstrapTool(toolName, toolInput)) return null;
+  if (isCancelSkillBootstrapTool(toolName, toolInput)) return null;
   const loaded = readSessionModeState(stateDir, 'ultragoal', sessionId);
   const state = loaded.state;
   if (!state?.active) return null;
@@ -763,6 +790,7 @@ function evaluateUltragoalPreToolEnforcement(stateDir, directory, sessionId, dat
   const objectiveMatches = Boolean(actualObjective && expectedObjective && actualObjective === expectedObjective);
   const activeStatus = status === '' || status === 'active' || status === 'in_progress' || status === 'running';
 
+  if (!expectedObjective && actualObjective && activeStatus) return null;
   if (objectiveMatches && activeStatus) return null;
 
   const mismatch = actualObjective
@@ -925,18 +953,18 @@ function generateAgentSpawnMessage(toolInput, stateDir, todoStatus, sessionId) {
   const bg = toolInput.run_in_background ? ' [BACKGROUND]' : '';
   const tracking = getAgentTrackingInfo(stateDir);
 
-  // Team-routing enforcement (issue #1006):
-  // When team state is active and Task is called WITHOUT team_name,
-  // inject a redirect message to use team agents instead of subagents.
+  // Team-routing guidance:
+  // Claude Code 2.1.178+ removed TeamCreate/TeamDelete. When OMC team state is
+  // active, teammates should be spawned into the session's implicit agent team by
+  // giving each Agent/Task call a distinct name. team_name is ignored by native
+  // Claude Code and should only be treated as legacy metadata.
   const teamState = getActiveTeamState(stateDir, sessionId);
-  if (teamState && !toolInput.team_name) {
+  if (teamState && !toolInput.name) {
     const teamName = teamState.team_name || teamState.teamName || 'team';
-    return `[TEAM ROUTING REQUIRED] Team "${teamName}" is active but you are spawning a regular subagent ` +
-      `without team_name. You MUST use TeamCreate first (if not already created), then spawn teammates with ` +
-      `Task(team_name="${teamName}", name="worker-N", subagent_type="${agentType}"). ` +
-      `Do NOT use Task without team_name during an active team session. ` +
-      `If TeamCreate is not available in your tools, tell the user to verify ` +
-      'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 is set in [$CLAUDE_CONFIG_DIR|~/.claude]/settings.json. Restart Claude Code.';
+    return `[TEAM ROUTING REQUIRED] Team "${teamName}" is active but you are spawning an unnamed subagent. ` +
+      `Claude Code 2.1.178+ uses the session's implicit native agent team; TeamCreate and TeamDelete are removed. ` +
+      `Spawn teammates directly with Agent/Task name="worker-N" and subagent_type="${agentType}". ` +
+      `Do NOT rely on team_name for routing; native Claude Code accepts it only as ignored legacy metadata.`;
   }
 
   if (QUIET_LEVEL >= 2) return '';
@@ -1245,6 +1273,10 @@ async function main() {
 
     const modeActive = hasActiveMode(stateDir, sessionId);
 
+    // When set, replaces the Task/Agent tool input via hookSpecificOutput.updatedInput
+    // so a configured per-agent model (agents.<name>.model) is applied (issue #3242).
+    let updatedToolInput = null;
+
     // Force-inherit check: deny Task/Agent calls with invalid model param when forceInherit is
     // enabled (Bedrock, Vertex, CC Switch, etc.) - issues #1135, #1201, #1767, #1868
     //
@@ -1344,6 +1376,19 @@ async function main() {
         }
         // else: no model param and no [1m] on session model → normal forceInherit,
         // agents inherit the parent session's model cleanly.
+      } else if (!toolModel && toolInput.subagent_type) {
+        // Non-forceInherit: honor agents.<name>.model from config.jsonc for native
+        // Task/Agent calls without an explicit model param. Without this, Claude Code
+        // reads the static agents/*.md frontmatter and silently ignores the user's
+        // per-agent override (issue #3242). Inject the resolved tier alias via
+        // updatedInput so the spawned subagent runs on the configured model.
+        const configuredModel = resolveConfiguredAgentModel(toolInput.subagent_type, directory);
+        if (configuredModel && configuredModel !== 'inherit') {
+          const normalizedModel = normalizeToCcAlias(configuredModel);
+          if (normalizedModel) {
+            updatedToolInput = { ...toolInput, model: normalizedModel };
+          }
+        }
       }
     }
 
@@ -1421,19 +1466,34 @@ async function main() {
 
     if (toolName === 'Task' || toolName === 'Agent') {
       const toolInput = data.toolInput || data.tool_input || null;
-      message = generateAgentSpawnMessage(toolInput, stateDir, todoStatus, sessionId);
+      // Reflect any injected per-agent model (issue #3242) in the advisory label.
+      message = generateAgentSpawnMessage(updatedToolInput || toolInput, stateDir, todoStatus, sessionId);
     } else {
       message = generateMessage(toolName, todoStatus, modeActive);
     }
     message = combineHookMessages(slopWarning, message);
 
+    // Carry any per-agent model injection (issue #3242) even when the advisory
+    // message is empty or throttled, so the configured model is always applied.
+    const modelInjection = updatedToolInput
+      ? { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: updatedToolInput } }
+      : null;
+
     if (!message) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      console.log(JSON.stringify(
+        modelInjection
+          ? { continue: true, suppressOutput: true, ...modelInjection }
+          : { continue: true, suppressOutput: true }
+      ));
       return;
     }
 
     if (!shouldEmitAdvisoryMessage(stateDir, sessionId, message)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      console.log(JSON.stringify(
+        modelInjection
+          ? { continue: true, suppressOutput: true, ...modelInjection }
+          : { continue: true, suppressOutput: true }
+      ));
       return;
     }
 
@@ -1441,7 +1501,8 @@ async function main() {
       continue: true,
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
-        additionalContext: message
+        additionalContext: message,
+        ...(updatedToolInput ? { updatedInput: updatedToolInput } : {})
       }
     }, null, 2));
   } catch (error) {

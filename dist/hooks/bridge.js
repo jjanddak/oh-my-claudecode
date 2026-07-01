@@ -558,7 +558,7 @@ function seedRalplanStartupState(directory, sessionId) {
     markModeAwaitingConfirmation(directory, sessionId, "ralplan");
 }
 async function seedAutopilotStartupState(directory, prompt, sessionId) {
-    const { readAutopilotState, writeAutopilotState, DEFAULT_CONFIG } = await import("./autopilot/index.js");
+    const { readAutopilotState, writeAutopilotState, DEFAULT_CONFIG, resolvePipelineConfig, buildPipelineTracking, } = await import("./autopilot/index.js");
     const existingState = readAutopilotState(directory, sessionId);
     const existingAutopilotRecord = existingState;
     if (existingState?.active === true) {
@@ -567,8 +567,9 @@ async function seedAutopilotStartupState(directory, prompt, sessionId) {
         }
         return;
     }
+    const config = loadConfig();
     const now = new Date().toISOString();
-    const wrote = writeAutopilotState(directory, {
+    const state = {
         active: true,
         phase: "expansion",
         current_phase: "expansion",
@@ -614,7 +615,15 @@ async function seedAutopilotStartupState(directory, prompt, sessionId) {
         wisdom_entries: 0,
         session_id: sessionId,
         project_path: directory,
-    }, sessionId);
+    };
+    const autopilotConfig = config.autopilot;
+    const shouldUsePipeline = autopilotConfig?.execution === "team";
+    if (shouldUsePipeline) {
+        const pipelineConfig = resolvePipelineConfig(autopilotConfig);
+        state.pipeline =
+            buildPipelineTracking(pipelineConfig);
+    }
+    const wrote = writeAutopilotState(directory, state, sessionId);
     if (wrote) {
         markModeAwaitingConfirmation(directory, sessionId, "autopilot");
     }
@@ -886,7 +895,7 @@ function getPromptText(input) {
     return "";
 }
 function isExplicitAskSlashInvocation(promptText) {
-    return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|grok)\b/i.test(promptText);
+    return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|antigravity|agy|grok|cursor)\b/i.test(promptText);
 }
 function activateRalplanStartupState(directory, sessionId) {
     const now = new Date().toISOString();
@@ -1234,7 +1243,9 @@ async function processKeywordDetector(input) {
                 messages.push(`[MODE: ${keywordType.toUpperCase()}] Skill invocation handled by UserPromptSubmit hook.`);
                 break;
             case "codex":
-            case "gemini": {
+            case "gemini":
+            case "cursor":
+            case "antigravity": {
                 const teamStartCommand = formatOmcCliInvocation(`team start --agent ${keywordType} --count N --task "<task from user message>"`);
                 messages.push(`[MAGIC KEYWORD: team]\n` +
                     `User intent: delegate to ${keywordType} CLI workers via ${formatOmcCliInvocation('team')}.\n` +
@@ -1609,7 +1620,7 @@ Please continue working on these tasks.
 This environment uses a non-standard model provider (AWS Bedrock, Google Vertex AI, or a proxy such as CC Switch / LiteLLM).
 
 How to pass \`model\` on Task/Agent calls:
-- Prefer a tier alias: \`model: "sonnet"\`, \`model: "opus"\`, or \`model: "haiku"\`. OMC's pre-tool enforcer resolves these to provider-safe IDs when one of these env vars is set: \`ANTHROPIC_DEFAULT_SONNET_MODEL\` (and sibling \`ANTHROPIC_DEFAULT_OPUS_MODEL\` / \`ANTHROPIC_DEFAULT_HAIKU_MODEL\`), \`CLAUDE_CODE_BEDROCK_SONNET_MODEL\` (and sibling \`CLAUDE_CODE_BEDROCK_OPUS_MODEL\` / \`CLAUDE_CODE_BEDROCK_HAIKU_MODEL\`), or \`OMC_SUBAGENT_MODEL\`.
+- Prefer a tier alias: \`model: "sonnet"\`, \`model: "opus"\`, \`model: "haiku"\`, or \`model: "fable"\` (Claude Fable 5, above Opus). OMC's pre-tool enforcer resolves these to provider-safe IDs when one of these env vars is set: \`ANTHROPIC_DEFAULT_SONNET_MODEL\` (and siblings \`ANTHROPIC_DEFAULT_OPUS_MODEL\` / \`ANTHROPIC_DEFAULT_HAIKU_MODEL\` / \`ANTHROPIC_DEFAULT_FABLE_MODEL\`), \`CLAUDE_CODE_BEDROCK_SONNET_MODEL\` (and siblings \`CLAUDE_CODE_BEDROCK_OPUS_MODEL\` / \`CLAUDE_CODE_BEDROCK_HAIKU_MODEL\` / \`CLAUDE_CODE_BEDROCK_FABLE_MODEL\`), or \`OMC_SUBAGENT_MODEL\`.
 - If none of those env vars are configured, the enforcer will deny the tier alias with an env-var configuration hint — set one of them in your \`settings.json\` env or shell profile.
 - The enforcer denies tier aliases it cannot resolve. It also denies provider-specific IDs that carry a \`[1m]\` context-window suffix or otherwise fail subagent-safe validation (sub-agents cannot inherit \`[1m]\`). Valid provider-specific IDs without extended-context suffixes are allowed.
 
@@ -2204,13 +2215,25 @@ async function processPostToolUse(input) {
 async function processAutopilot(input) {
     const directory = resolveToWorktreeRoot(input.directory);
     // Lazy-load autopilot module
-    const { readAutopilotState, getPhasePrompt } = await import("./autopilot/index.js");
+    const { readAutopilotState, getPhasePrompt, hasPipelineTracking, generatePipelinePrompt, } = await import("./autopilot/index.js");
     const state = readAutopilotState(directory, input.sessionId);
     if (!state || !state.active) {
         return { continue: true };
     }
-    // Check phase and inject appropriate prompt
     const config = loadConfig();
+    if (hasPipelineTracking(state)) {
+        const pipelinePrompt = generatePipelinePrompt(directory, input.sessionId);
+        const runtimeInsight = formatAutopilotRuntimeInsight(directory, input.sessionId);
+        if (pipelinePrompt || runtimeInsight) {
+            const detailParts = [runtimeInsight, pipelinePrompt].filter(Boolean);
+            return {
+                continue: true,
+                message: `[AUTOPILOT - Pipeline]\n\n${detailParts.join("\n\n")}`,
+            };
+        }
+        return { continue: true };
+    }
+    // Check phase and inject appropriate prompt
     const context = {
         idea: state.originalIdea,
         specPath: state.expansion.spec_path || ".omc/autopilot/spec.md",

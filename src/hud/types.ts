@@ -96,6 +96,8 @@ export interface ActiveAgent {
   id: string;
   type: string;
   model?: string;
+  /** Native Claude Code teammate name when spawned with Agent/Task name="..." */
+  name?: string;
   description?: string;
   status: 'running' | 'completed';
   startTime: Date;
@@ -398,6 +400,9 @@ export interface HudRenderContext {
 
   /** API key source: 'project', 'global', or 'env' */
   apiKeySource: ApiKeySource | null;
+
+  /** True when an Anthropic API key is active (no OAuth subscription); used to surface a usage hint when built-in usage cannot be fetched */
+  apiKeyMode?: boolean;
 
   /** OAuth subscription type (e.g. 'enterprise'), null when unavailable */
   subscriptionType?: string | null;

@@ -81,6 +81,66 @@ async function cmuxExecAsync(args: string[]): Promise<{ stdout: string; stderr: 
   };
 }
 
+function getCmuxErrorText(error: unknown): string {
+  if (error instanceof Error) {
+    const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
+      ? (error as { stderr?: string }).stderr
+      : '';
+    return `${error.message}\n${stderr}`.trim();
+  }
+  return String(error);
+}
+
+function isCmuxDialectFailure(error: unknown): boolean {
+  const text = getCmuxErrorText(error);
+  return /(?:unknown|unrecognized|invalid|unsupported) (?:command|subcommand|option)|no such (?:command|subcommand)|Found argument .*--surface.*wasn't expected|unexpected argument|unexpected option/i.test(text);
+}
+
+function redactCmuxFailureMessage(error: unknown, argLists: string[][]): string {
+  let message = getCmuxErrorText(error);
+  const commandNames = new Set(argLists.map(args => args[0]).filter(Boolean));
+  const sensitiveArgs = [...new Set(argLists.flatMap(args => args).flatMap(arg => {
+    if (!arg || commandNames.has(arg)) return [];
+    const fragments = arg.match(/[A-Za-z0-9_./:@=-]{4,}/g) ?? [];
+    return [arg, ...fragments];
+  }))].sort((a, b) => b.length - a.length);
+
+  for (const arg of sensitiveArgs) {
+    message = message.split(arg).join('[redacted]');
+  }
+
+  return message;
+}
+
+async function cmuxExecPrimaryWithLegacyFallback(
+  primaryArgs: string[],
+  legacyArgs: string[],
+): Promise<{ stdout: string; stderr: string }> {
+  try {
+    return await cmuxExecAsync(primaryArgs);
+  } catch (primaryError) {
+    if (!isCmuxDialectFailure(primaryError)) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs]);
+      const error = new Error(
+        `cmux command failed for current form: current=${primaryArgs[0] ?? '<unknown>'} (${primaryMessage})`,
+      );
+      (error as { cause?: unknown }).cause = primaryError;
+      throw error;
+    }
+
+    try {
+      return await cmuxExecAsync(legacyArgs);
+    } catch (legacyError) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs, legacyArgs]);
+      const legacyMessage = redactCmuxFailureMessage(legacyError, [primaryArgs, legacyArgs]);
+      throw new Error(
+        `cmux command failed for both current and legacy forms: current=${primaryArgs[0] ?? '<unknown>'} (${primaryMessage}); ` +
+        `legacy=${legacyArgs[0] ?? '<unknown>'} (${legacyMessage})`,
+      );
+    }
+  }
+}
+
 function parseCmuxSurfaceId(output: string): string {
   const trimmed = output.trim();
   const uuidMatch = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
@@ -99,15 +159,55 @@ async function cmuxSplitSurface(targetSurfaceId: string, direction: 'right' | 'd
 }
 
 async function cmuxSendSurface(surfaceId: string, text: string): Promise<void> {
-  await cmuxExecAsync(['send', '--surface', surfaceId, text]);
+  // cmux 0.64.x targets a specific surface with the dedicated
+  // `send-surface` subcommand. `cmux send --surface ...` is parsed as the
+  // focused-surface form plus an unknown option in current cmux builds, which
+  // makes worker startup fail after the split/worktree has already been
+  // created. The top-level `omc team` catch then prints generic usage and the
+  // startup rollback tears the empty worktree down. (#3325)
+  await cmuxExecPrimaryWithLegacyFallback(
+    ['send-surface', '--surface', surfaceId, text],
+    ['send', '--surface', surfaceId, text],
+  );
+}
+
+function normalizeCmuxKey(key: string): string {
+  const normalized = key.trim();
+  const lower = normalized.toLowerCase();
+  switch (lower) {
+    case 'enter':
+    case 'return':
+    case 'tab':
+    case 'escape':
+    case 'esc':
+    case 'backspace':
+    case 'delete':
+    case 'up':
+    case 'down':
+    case 'left':
+    case 'right':
+      return lower === 'return' ? 'enter' : lower === 'esc' ? 'escape' : lower;
+    default:
+      return normalized;
+  }
 }
 
 async function cmuxSendSurfaceKey(surfaceId: string, key: string): Promise<void> {
-  await cmuxExecAsync(['send-key', '--surface', surfaceId, key]);
+  // See cmuxSendSurface(): targeting a surface uses `send-key-surface`, not a
+  // `--surface` option on `send-key`. Key names are lower-case in the cmux CLI
+  // reference; normalize common names while leaving advanced chord strings alone.
+  const normalizedKey = normalizeCmuxKey(key);
+  await cmuxExecPrimaryWithLegacyFallback(
+    ['send-key-surface', '--surface', surfaceId, normalizedKey],
+    ['send-key', '--surface', surfaceId, key],
+  );
 }
 
 async function cmuxCaptureSurface(surfaceId: string): Promise<string> {
-  const result = await cmuxExecAsync(['capture-pane', '--surface', surfaceId, '--scrollback']);
+  const result = await cmuxExecPrimaryWithLegacyFallback(
+    ['read-screen', '--surface', surfaceId],
+    ['capture-pane', '--surface', surfaceId, '--scrollback'],
+  );
   return result.stdout;
 }
 
@@ -330,9 +430,14 @@ async function waitForShellReady(paneId: string, opts: WaitForShellReadyOptions 
 async function verifyWorkerStartCommandDelivered(paneId: string, startCmd: string): Promise<boolean> {
   if (isCmuxSurfaceTarget(paneId)) return true;
   const expected = normalizeTmuxCapture(startCmd);
+  const compactExpected = normalizeTmuxCaptureForDelivery(startCmd);
   for (let attempt = 1; attempt <= 5; attempt++) {
     const captured = await capturePaneAsync(paneId, { joinWrappedLines: true });
-    if (normalizeTmuxCapture(captured).includes(expected)) {
+    const normalizedCaptured = normalizeTmuxCapture(captured);
+    if (normalizedCaptured.includes(expected)) {
+      return true;
+    }
+    if (compactExpected.length > 0 && normalizeTmuxCaptureForDelivery(captured).includes(compactExpected)) {
       return true;
     }
     await sleep(50);
@@ -340,21 +445,34 @@ async function verifyWorkerStartCommandDelivered(paneId: string, startCmd: strin
   return false;
 }
 
+async function verifyWorkerStartCommandSubmitted(paneId: string, startCmd: string): Promise<boolean> {
+  if (isCmuxSurfaceTarget(paneId)) return true;
+  const expected = normalizeTmuxCapture(startCmd);
+  const compactExpected = normalizeTmuxCaptureForDelivery(startCmd);
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const captured = await capturePaneAsync(paneId, { joinWrappedLines: true });
+    const normalizedCaptured = normalizeTmuxCapture(captured);
+    const commandStillBuffered = normalizedCaptured.includes(expected)
+      || (compactExpected.length > 0 && normalizeTmuxCaptureForDelivery(captured).includes(compactExpected));
+    if (!commandStillBuffered) {
+      return true;
+    }
+    await sleep(50);
+  }
+  return false;
+}
+
+function workerPaneShellCommand(): string[] {
+  if (process.platform === 'win32' && !isUnixLikeOnWindows()) {
+    return [getDefaultShell()];
+  }
+  return [];
+}
+
 function escapeForCmdSet(value: string): string {
-  return value.replace(/"/g, '""');
+  return value.replace(/(["%])/g, '$1$1');
 }
 
-function escapeForPowerShellSingleQuotedString(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-function isNativeWindowsPsmuxPowerShellPane(): boolean {
-  // psmux sets PSMUX_SESSION in panes. Native psmux defaults to PowerShell,
-  // while MSYS/Git Bash psmux panes still need the POSIX branch below.
-  return process.platform === 'win32' &&
-    !isUnixLikeOnWindows() &&
-    !!process.env.PSMUX_SESSION;
-}
 
 function shellNameFromPath(shellPath: string): string {
   const shellName = basename(shellPath.replace(/\\/g, '/'));
@@ -411,18 +529,6 @@ export function buildWorkerStartCommand(config: WorkerPaneConfig): string {
   const launchWords = getLaunchWords(config);
   const shouldSourceRc = process.env.OMC_TEAM_NO_RC !== '1';
 
-  if (isNativeWindowsPsmuxPowerShellPane()) {
-    const envStatements = Object.entries(config.envVars)
-      .map(([k, v]) => {
-        assertSafeEnvKey(k);
-        return `$env:${k}=${escapeForPowerShellSingleQuotedString(v)}`;
-      });
-    const launch = [
-      '&',
-      ...launchWords.map(escapeForPowerShellSingleQuotedString),
-    ].join(' ');
-    return [...envStatements, launch].join('; ');
-  }
 
   if (process.platform === 'win32' && !isUnixLikeOnWindows()) {
     const envPrefix = Object.entries(config.envVars)
@@ -564,6 +670,7 @@ export function createSession(teamName: string, workerName: string, workingDirec
   if (workingDirectory) {
     args.push('-c', workingDirectory);
   }
+  args.push(...workerPaneShellCommand());
   tmuxExec(args, { stripTmux: true, stdio: 'pipe', timeout: 5000 });
   try {
     configureTmuxClipboardForSession(name, { stripTmux: true, stdio: 'pipe', timeout: 5000 });
@@ -650,6 +757,34 @@ export function spawnBridgeInSession(
  * Layout: leader pane on the left, worker panes stacked vertically on the right.
  * IMPORTANT: Uses pane IDs (%N format) not pane indices for stable targeting.
  */
+/**
+ * Split a new worker pane off `splitTarget`, honoring the active multiplexer.
+ *
+ * Under cmux a worker MUST be a native cmux surface (UUID), not a tmux pane id
+ * (`%N`). Otherwise spawnWorkerInPane()/waitForShellReady() classify the worker
+ * as a tmux pane, poll tmux for shell readiness, and time out after 5s with
+ * `worker_start_shell_not_ready` — abandoning the worker's git worktree.
+ * createTeamSession() already branches this way for panes created up front; the
+ * on-demand worker spawns in both team runtimes must do the same. (#3267)
+ */
+export async function splitTeamWorkerPane(
+  splitTarget: string,
+  direction: 'right' | 'down',
+  cwd: string,
+): Promise<string | null> {
+  if (isCmuxContext()) {
+    return cmuxSplitSurface(splitTarget, direction, cwd);
+  }
+  const splitType = direction === 'right' ? '-h' : '-v';
+  const splitResult = await tmuxExecAsync([
+    'split-window', splitType, '-t', splitTarget,
+    '-d', '-P', '-F', '#{pane_id}',
+    '-c', cwd,
+    ...workerPaneShellCommand(),
+  ]);
+  return splitResult.stdout.split('\n')[0]?.trim() || null;
+}
+
 export async function createTeamSession(
   teamName: string,
   workerCount: number,
@@ -688,6 +823,7 @@ export async function createTeamSession(
       'new-session', '-d', '-P', '-F', '#S:0 #{pane_id}',
       '-s', detachedSessionName,
       '-c', cwd,
+      ...workerPaneShellCommand(),
     ], { stripTmux: true });
     const detachedLine = detachedResult.stdout.trim();
     const detachedMatch = detachedLine.match(/^(\S+)\s+(%\d+)$/);
@@ -784,6 +920,7 @@ export async function createTeamSession(
       'split-window', splitType, '-t', splitTarget,
       '-d', '-P', '-F', '#{pane_id}',
       '-c', cwd,
+      ...workerPaneShellCommand(),
     ]);
     const paneId = splitResult.stdout.split('\n')[0]?.trim();
     if (paneId) {
@@ -887,9 +1024,18 @@ export async function spawnWorkerInPane(
   try {
     const enterResult = await tmuxExecAsync(['send-keys', '-t', paneId, 'Enter'], { timeout: 5000 });
     logWorkerSpawnDiagnostic(
-      `worker start submit sent session=${sessionName} pane=${paneId} ` +
+      `worker start submit key sent session=${sessionName} pane=${paneId} ` +
       `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=0 stderr=${JSON.stringify(enterResult.stderr.trim())}`,
     );
+    const submitted = await verifyWorkerStartCommandSubmitted(paneId, startCmd);
+    if (!submitted) {
+      const reason = `worker_start_submit_unverified:${config.workerName}:${paneId}:${fingerprint}`;
+      logWorkerSpawnDiagnostic(
+        `worker start submit verification failed session=${sessionName} pane=${paneId} ` +
+        `worker=${config.workerName} cmdSha=${fingerprint} cmdPreview=${JSON.stringify(preview)}`,
+      );
+      throw new Error(reason);
+    }
   } catch (error) {
     logWorkerSpawnDiagnostic(
       `worker start submit failed session=${sessionName} pane=${paneId} ` +
@@ -901,6 +1047,10 @@ export async function spawnWorkerInPane(
 
 function normalizeTmuxCapture(value: string): string {
   return value.replace(/\r/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeTmuxCaptureForDelivery(value: string): string {
+  return value.replace(/\r/g, '').replace(/\s+/g, '');
 }
 
 async function capturePaneAsync(paneId: string, opts: { joinWrappedLines?: boolean } = {}): Promise<string> {

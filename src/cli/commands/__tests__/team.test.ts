@@ -177,13 +177,33 @@ describe('teamCommand api operations', () => {
 
   it('blocks team start when running inside worker context', async () => {
     const previousWorker = process.env.OMC_TEAM_WORKER;
+    const errors: string[] = [];
+    const originalError = console.error;
     try {
+      console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
       process.env.OMC_TEAM_WORKER = 'demo-team/worker-1';
       const logs = await captureLog(() => teamCommand(['1:executor', 'do work']));
-      expect(logs[0]).toContain('omc team [N:agent-type[:role]]');
+      expect(logs.join('\n')).not.toContain('Usage: omc team');
+      expect(errors.join('\n')).toContain('nested_teams_allowed is false');
       expect(process.exitCode).toBe(1);
     } finally {
+      console.error = originalError;
       process.env.OMC_TEAM_WORKER = previousWorker;
+      process.exitCode = 0;
+    }
+  });
+
+  it('reports malformed worker specs without dumping generic team usage', async () => {
+    const errors: string[] = [];
+    const originalError = console.error;
+    try {
+      console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
+      const logs = await captureLog(() => teamCommand(['1:claude:executor:extra', 'do work']));
+      expect(errors.join('\n')).toContain('Invalid worker spec "1:claude:executor:extra"');
+      expect(logs.join('\n')).not.toContain('Usage: omc team');
+      expect(process.exitCode).toBe(1);
+    } finally {
+      console.error = originalError;
       process.exitCode = 0;
     }
   });
@@ -322,6 +342,50 @@ describe('parseTeamArgs comma-separated multi-type specs', () => {
     );
   });
 
+  it('does not reject a single explicit worker when prose contains "and"/commas (#3267)', () => {
+    const parsed = parseTeamArgs(['1:executor', 'Read plan.md and execute it then commit the result']);
+    expect(parsed.workerCount).toBe(1);
+    expect(parsed.explicitWorkerSpec).toBe(true);
+
+    const decomposition = splitTaskString(parsed.task);
+    // Free-form prose still parses as a conjunction heuristic...
+    expect(decomposition.strategy).toBe('conjunction');
+    expect(decomposition.subtasks.length).toBeGreaterThan(1);
+
+    const effective = resolveTeamFanoutLimit(
+      parsed.workerCount,
+      parsed.agentTypes[0],
+      parsed.explicitWorkerSpec ? parsed.workerCount : undefined,
+      decomposition,
+      parsed.noDecompose,
+    );
+    expect(effective).toBe(1);
+
+    // ...but a conjunction guess must NOT reject the explicit worker spec.
+    const tasks = buildTeamLaunchTasks(parsed, decomposition, effective);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].description).toBe(parsed.task);
+  });
+
+  it('gives every explicit worker the full prose instead of splitting on conjunctions (#3267)', () => {
+    const parsed = parseTeamArgs(['2:codex', 'review the parser and patch the runtime']);
+    const decomposition = splitTaskString(parsed.task);
+    expect(decomposition.strategy).toBe('conjunction');
+    expect(decomposition.subtasks).toHaveLength(2);
+
+    const effective = resolveTeamFanoutLimit(
+      parsed.workerCount,
+      parsed.agentTypes[0],
+      parsed.explicitWorkerSpec ? parsed.workerCount : undefined,
+      decomposition,
+      parsed.noDecompose,
+    );
+    expect(effective).toBe(2);
+
+    const tasks = buildTeamLaunchTasks(parsed, decomposition, effective);
+    expect(tasks.map((task) => task.description)).toEqual([parsed.task, parsed.task]);
+  });
+
   it('maps pre-authored numbered scopes to explicit workers when counts match', () => {
     const parsed = parseTeamArgs([
       '1:claude,2:codex',
@@ -444,6 +508,66 @@ describe('parseTeamArgs comma-separated multi-type specs', () => {
     expect(parsed.task).toBe('fix tests');
   });
 
+  it('parses single-type spec 3:cursor into uniform agentTypes', () => {
+    const parsed = parseTeamArgs(['3:cursor', 'apply implementation']);
+    expect(parsed.workerCount).toBe(3);
+    expect(parsed.agentTypes).toEqual(['cursor', 'cursor', 'cursor']);
+    expect(parsed.workerSpecs).toEqual([
+      { agentType: 'cursor' },
+      { agentType: 'cursor' },
+      { agentType: 'cursor' },
+    ]);
+    expect(parsed.task).toBe('apply implementation');
+  });
+
+  it('supports cursor in mixed explicit cli specs', () => {
+    const parsed = parseTeamArgs(['1:cursor,1:codex', 'compare edits']);
+    expect(parsed.workerCount).toBe(2);
+    expect(parsed.agentTypes).toEqual(['cursor', 'codex']);
+    expect(parsed.workerSpecs).toEqual([
+      { agentType: 'cursor' },
+      { agentType: 'codex' },
+    ]);
+    expect(parsed.task).toBe('compare edits');
+  });
+
+  it('rejects cursor with non-executor explicit roles', () => {
+    expect(() => parseTeamArgs(['1:cursor:architect', 'design auth'])).toThrow(
+      /Cursor workers are executor-style only/,
+    );
+    expect(() => parseTeamArgs(['1:cursor:security-reviewer', 'review auth'])).toThrow(
+      /Cursor workers are executor-style only/,
+    );
+  });
+
+  it('parses single-type spec 2:antigravity into uniform agentTypes', () => {
+    const parsed = parseTeamArgs(['2:antigravity', 'apply implementation']);
+    expect(parsed.workerCount).toBe(2);
+    expect(parsed.agentTypes).toEqual(['antigravity', 'antigravity']);
+    expect(parsed.workerSpecs).toEqual([
+      { agentType: 'antigravity' },
+      { agentType: 'antigravity' },
+    ]);
+    expect(parsed.task).toBe('apply implementation');
+  });
+
+  it('supports antigravity in mixed explicit cli specs', () => {
+    const parsed = parseTeamArgs(['1:antigravity,1:codex', 'compare edits']);
+    expect(parsed.workerCount).toBe(2);
+    expect(parsed.agentTypes).toEqual(['antigravity', 'codex']);
+    expect(parsed.task).toBe('compare edits');
+  });
+
+  it('parses antigravity with an explicit executor role', () => {
+    const parsed = parseTeamArgs(['1:antigravity:executor', 'apply the implementation']);
+    expect(parsed.agentTypes).toEqual(['antigravity']);
+  });
+
+  it('uses configured antigravity CLI provider default when supported', () => {
+    const parsed = parseTeamArgs(['run all tests'], 'antigravity');
+    expect(parsed.agentTypes).toEqual(['antigravity', 'antigravity', 'antigravity']);
+  });
+
   it('defaults to 3 claude workers when no spec is given', () => {
     const parsed = parseTeamArgs(['run all tests']);
     expect(parsed.workerCount).toBe(3);
@@ -452,12 +576,12 @@ describe('parseTeamArgs comma-separated multi-type specs', () => {
   });
 
   it('uses configured CLI provider default when it is supported', () => {
-    const parsed = parseTeamArgs(['run all tests'], 'codex');
-    expect(parsed.agentTypes).toEqual(['codex', 'codex', 'codex']);
+    const parsed = parseTeamArgs(['run all tests'], 'cursor');
+    expect(parsed.agentTypes).toEqual(['cursor', 'cursor', 'cursor']);
     expect(parsed.workerSpecs).toEqual([
-      { agentType: 'codex' },
-      { agentType: 'codex' },
-      { agentType: 'codex' },
+      { agentType: 'cursor' },
+      { agentType: 'cursor' },
+      { agentType: 'cursor' },
     ]);
   });
 

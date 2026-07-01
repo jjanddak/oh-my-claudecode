@@ -8,29 +8,30 @@ vi.mock('child_process', async (importOriginal) => {
     const actual = await importOriginal();
     const runMockExec = (args) => {
         mockedCalls.execFileArgs.push(args);
-        if (args[0] === 'new-session') {
+        const tmuxArgs = args[0]?.toLowerCase().endsWith('cmd.exe') ? args.slice(1) : args;
+        if (tmuxArgs[0] === 'new-session') {
             return { stdout: 'omc-team-race-team-detached:0 %91\n', stderr: '' };
         }
-        if (args[0] === 'new-window') {
+        if (tmuxArgs[0] === 'new-window') {
             return { stdout: 'omx:5 %99\n', stderr: '' };
         }
-        if (args[0] === 'display-message' && args.includes('#S:#I #{pane_id}')) {
+        if (tmuxArgs[0] === 'display-message' && tmuxArgs.includes('#S:#I #{pane_id}')) {
             return { stdout: 'fallback:2 %42\n', stderr: '' };
         }
-        if (args[0] === 'display-message' && args.includes('#S:#I')) {
+        if (tmuxArgs[0] === 'display-message' && tmuxArgs.includes('#S:#I')) {
             return { stdout: 'omx:4\n', stderr: '' };
         }
-        if (args[0] === 'display-message' && args.includes('#{window_width}')) {
+        if (tmuxArgs[0] === 'display-message' && tmuxArgs.includes('#{window_width}')) {
             return { stdout: '160\n', stderr: '' };
         }
-        if (args[0] === 'display-message' && args.includes('#{pane_dead} #{pane_current_command}')) {
+        if (tmuxArgs[0] === 'display-message' && tmuxArgs.includes('#{pane_dead} #{pane_current_command}')) {
             return { stdout: '0 zsh\n', stderr: '' };
         }
-        if (args[0] === 'split-window') {
+        if (tmuxArgs[0] === 'split-window') {
             mockedCalls.splitCount += 1;
             return { stdout: `%50${mockedCalls.splitCount}\n`, stderr: '' };
         }
-        if (args[0] === 'new-split') {
+        if (tmuxArgs[0] === 'new-split') {
             mockedCalls.splitCount += 1;
             return {
                 stdout: mockedCalls.newSplitStdouts.shift() ?? `cmux-worker-${mockedCalls.splitCount}\n`,
@@ -84,7 +85,7 @@ vi.mock('child_process', async (importOriginal) => {
         execSync: execSyncMock,
     };
 });
-import { createTeamSession, detectTeamMultiplexerContext } from '../tmux-session.js';
+import { createTeamSession, detectTeamMultiplexerContext, splitTeamWorkerPane } from '../tmux-session.js';
 describe('detectTeamMultiplexerContext', () => {
     afterEach(() => {
         vi.unstubAllEnvs();
@@ -195,6 +196,73 @@ describe('createTeamSession context resolution', () => {
         expect(session.sessionName).toBe('omx:5');
         expect(session.workerPaneIds).toEqual(['%501']);
         expect(session.sessionMode).toBe('dedicated-window');
+    });
+    it('launches native Windows psmux detached team sessions with explicit cmd shell', async () => {
+        vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+        vi.stubEnv('TMUX', '');
+        vi.stubEnv('TMUX_PANE', '');
+        vi.stubEnv('CMUX_SURFACE_ID', '');
+        vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
+        vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+        await createTeamSession('race-team', 0, 'C:\\repo');
+        const detachedCreateCall = mockedCalls.execFileArgs.find((args) => args.includes('new-session') && args.includes('-d') && args.includes('-P'));
+        expect(detachedCreateCall).toEqual(expect.arrayContaining(['new-session', '-d', '-P', '-F', '#S:0 #{pane_id}', '-s', expect.any(String), '-c', 'C:\\repo', 'C:\\Windows\\System32\\cmd.exe']));
+    });
+    it('launches native Windows psmux worker splits with explicit cmd shell', async () => {
+        vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+        vi.stubEnv('TMUX', '/tmp/tmux-1000/default,1,1');
+        vi.stubEnv('TMUX_PANE', '%732');
+        vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
+        vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+        await createTeamSession('race-team', 1, 'C:\\repo');
+        const firstSplitCall = mockedCalls.execFileArgs.find((args) => args.includes('split-window'));
+        expect(firstSplitCall).toEqual(expect.arrayContaining(['split-window', '-h', '-t', '%732', '-d', '-P', '-F', '#{pane_id}', '-c', 'C:\\repo', 'C:\\Windows\\System32\\cmd.exe']));
+    });
+    it('keeps MSYS psmux team panes on POSIX shell defaults', async () => {
+        vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+        vi.stubEnv('TMUX', '/tmp/tmux-1000/default,1,1');
+        vi.stubEnv('TMUX_PANE', '%732');
+        vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
+        vi.stubEnv('MSYSTEM', 'MINGW64');
+        vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+        await createTeamSession('race-team', 1, '/c/repo');
+        const firstSplitCall = mockedCalls.execFileArgs.find((args) => args[0] === 'split-window');
+        expect(firstSplitCall).toEqual(expect.arrayContaining(['split-window', '-h', '-t', '%732']));
+        expect(firstSplitCall).not.toContain('C:\\Windows\\System32\\cmd.exe');
+    });
+});
+describe('splitTeamWorkerPane multiplexer routing (#3267)', () => {
+    beforeEach(() => {
+        mockedCalls.execFileArgs = [];
+        mockedCalls.splitCount = 0;
+        mockedCalls.newSplitStdouts = [];
+    });
+    afterEach(() => {
+        vi.unstubAllEnvs();
+        vi.restoreAllMocks();
+    });
+    it('creates a native cmux surface (not a tmux pane) for on-demand workers under cmux', async () => {
+        vi.stubEnv('TMUX', '');
+        vi.stubEnv('TMUX_PANE', '');
+        vi.stubEnv('CMUX_SURFACE_ID', 'cmux-leader');
+        vi.stubEnv('CMUX_WORKSPACE_ID', 'workspace-1');
+        const paneId = await splitTeamWorkerPane('cmux-leader', 'right', '/tmp');
+        // A cmux surface id (UUID/token) — NOT a tmux "%N" pane id — so that
+        // spawnWorkerInPane()/waitForShellReady() short-circuit instead of polling
+        // tmux and timing out with worker_start_shell_not_ready.
+        expect(paneId).toBe('cmux-worker-1');
+        expect(paneId?.startsWith('%')).toBe(false);
+        expect(mockedCalls.execFileArgs).toContainEqual(['new-split', 'right', '--surface', 'cmux-leader', '--workspace', 'workspace-1']);
+        expect(mockedCalls.execFileArgs.some((args) => args[0] === 'split-window')).toBe(false);
+    });
+    it('falls back to a tmux split-window pane id when running under tmux', async () => {
+        vi.stubEnv('TMUX', '/tmp/tmux-1000/default,1,1');
+        vi.stubEnv('TMUX_PANE', '%732');
+        vi.stubEnv('CMUX_SURFACE_ID', '');
+        const paneId = await splitTeamWorkerPane('%732', 'down', '/tmp');
+        expect(paneId).toBe('%501');
+        expect(mockedCalls.execFileArgs).toContainEqual(expect.arrayContaining(['split-window', '-v', '-t', '%732']));
+        expect(mockedCalls.execFileArgs.some((args) => args[0] === 'new-split')).toBe(false);
     });
 });
 //# sourceMappingURL=tmux-session.create-team.test.js.map

@@ -26,7 +26,8 @@ import { getOmcRoot } from '../../lib/worktree-paths.js';
 const HELP_TOKENS = new Set(['--help', '-h', 'help']);
 const MIN_WORKER_COUNT = 1;
 const MAX_WORKER_COUNT = 20;
-const VALID_TEAM_CLI_AGENT_TYPES = new Set(['claude', 'codex', 'gemini', 'grok']);
+const VALID_TEAM_CLI_AGENT_TYPES = new Set(['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity']);
+const CURSOR_ALLOWED_TEAM_ROLES = new Set(['executor']);
 const DEFAULT_TEAM_CLI_AGENT_TYPE: CliAgentType = 'claude';
 
 const TEAM_HELP = `
@@ -41,6 +42,8 @@ Examples:
   omc team 2:codex:architect "design auth system"
   omc team 1:gemini:executor "implement feature"
   omc team 1:codex,1:gemini "compare approaches"
+  omc team 1:cursor:executor "apply the implementation"
+  omc team 1:antigravity:executor "apply the implementation"
   omc team 2:codex "review auth flow" --new-window
   omc team status fix-failing-tests
   omc team shutdown fix-failing-tests
@@ -58,6 +61,8 @@ Auto-merge (v2-only):
 
 Roles (optional): architect, executor, planner, analyst, critic, debugger, verifier,
   code-reviewer, security-reviewer, test-engineer, designer, writer, scientist
+
+Cursor workers are executor-style only; use 1:cursor or 1:cursor:executor, not reviewer/critic/security/verdict roles.
 `;
 
 const TEAM_API_HELP = `
@@ -122,6 +127,11 @@ const TEAM_API_OPERATION_NOTES: Partial<Record<TeamApiOperation, string>> = {
   'release-task-claim': 'Use this only for rollback/requeue to pending (not for completion).',
   'transition-task-status': 'Lifecycle flow is claim-safe and typically transitions in_progress -> completed|failed.',
 };
+
+function shouldPrintTeamHelpForError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^Usage:\s+omc team\b/.test(message);
+}
 
 // ---------------------------------------------------------------------------
 // Task decomposition helpers
@@ -362,6 +372,12 @@ function normalizeWorkerSpecSegment(match: RegExpMatchArray): NormalizedWorkerSp
         `For a role-only shorthand on the default agent, use "${count}:${explicitRole}".`,
       );
     }
+    if (token === 'cursor' && !CURSOR_ALLOWED_TEAM_ROLES.has(explicitRole)) {
+      throw new Error(
+        `Invalid Cursor worker role "${explicitRole}" in worker spec "${match[0]}". ` +
+        `Cursor workers are executor-style only; use "${count}:cursor" or "${count}:cursor:executor".`,
+      );
+    }
     return { count, agentType: token, role: explicitRole };
   }
 
@@ -515,9 +531,18 @@ export function buildTeamLaunchTasks(
   effectiveWorkerCount: number,
 ): TeamLaunchTask[] {
   const tasks: TeamLaunchTask[] = [];
+
+  // Numbered/bulleted lists are explicit pre-authored scopes the user typed out,
+  // so they must line up with an explicit worker count. A `conjunction` split is
+  // only a heuristic guess at parallelism inside free-form prose (e.g.
+  // "Read X and execute it then commit"), so it must never reject or reshape an
+  // explicit worker spec — every worker just receives the full launch text. (#3267)
+  const isPreauthoredScopeList = decomposition.strategy === 'numbered'
+    || decomposition.strategy === 'bulleted';
+
   if (parsed.explicitWorkerSpec
     && !parsed.noDecompose
-    && decomposition.strategy !== 'atomic'
+    && isPreauthoredScopeList
     && decomposition.subtasks.length > 1
     && decomposition.subtasks.length !== effectiveWorkerCount) {
     throw new Error(
@@ -528,7 +553,8 @@ export function buildTeamLaunchTasks(
   const canUseDecomposition = !parsed.noDecompose
     && decomposition.strategy !== 'atomic'
     && decomposition.subtasks.length > 1
-    && (!parsed.explicitWorkerSpec || decomposition.subtasks.length === effectiveWorkerCount);
+    && (!parsed.explicitWorkerSpec
+      || (isPreauthoredScopeList && decomposition.subtasks.length === effectiveWorkerCount));
 
   for (let i = 0; i < effectiveWorkerCount; i++) {
     const workerSpec = parsed.workerSpecs[i];
@@ -996,7 +1022,9 @@ export async function teamCommand(args: string[]): Promise<void> {
     await handleTeamStart(parsed, cwd);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
-    console.log(TEAM_HELP.trim());
+    if (shouldPrintTeamHelpForError(error)) {
+      console.log(TEAM_HELP.trim());
+    }
     process.exitCode = 1;
   }
 }

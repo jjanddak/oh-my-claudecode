@@ -330,7 +330,7 @@ var import_child_process2 = require("child_process");
 var import_path4 = require("path");
 var import_util = require("util");
 function tmuxEnv() {
-  const { TMUX: _, ...env } = process.env;
+  const { TMUX: _, PSMUX_SESSION: __, ...env } = process.env;
   return env;
 }
 function resolveEnv(opts) {
@@ -1272,7 +1272,8 @@ function findPermissionViolations(changedPaths, permissions, cwd) {
 var CLAUDE_FAMILY_DEFAULTS = {
   HAIKU: "claude-haiku-4-5",
   SONNET: "claude-sonnet-4-6",
-  OPUS: "claude-opus-4-8"
+  OPUS: "claude-opus-4-8",
+  FABLE: "claude-fable-5"
 };
 var BUILTIN_TIER_MODEL_DEFAULTS = {
   LOW: CLAUDE_FAMILY_DEFAULTS.HAIKU,
@@ -1282,14 +1283,18 @@ var BUILTIN_TIER_MODEL_DEFAULTS = {
 var CLAUDE_FAMILY_HIGH_VARIANTS = {
   HAIKU: `${CLAUDE_FAMILY_DEFAULTS.HAIKU}-high`,
   SONNET: `${CLAUDE_FAMILY_DEFAULTS.SONNET}-high`,
-  OPUS: `${CLAUDE_FAMILY_DEFAULTS.OPUS}-high`
+  OPUS: `${CLAUDE_FAMILY_DEFAULTS.OPUS}-high`,
+  FABLE: `${CLAUDE_FAMILY_DEFAULTS.FABLE}-high`
 };
 var BUILTIN_EXTERNAL_MODEL_DEFAULTS = {
   codexModel: "gpt-5.3-codex",
-  geminiModel: "gemini-3.1-pro-preview"
+  geminiModel: "gemini-3.1-pro-preview",
+  antigravityModel: "Gemini 3.1 Pro (High)"
 };
 function getBuiltinExternalDefaultModel(provider) {
-  return provider === "codex" ? BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel : BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel;
+  if (provider === "codex") return BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel;
+  if (provider === "antigravity") return BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel;
+  return BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel;
 }
 
 // src/agents/prompt-helpers.ts

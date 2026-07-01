@@ -18079,11 +18079,17 @@ var import_child_process2 = require("child_process");
 var import_path3 = require("path");
 var import_util5 = require("util");
 function tmuxEnv() {
-  const { TMUX: _, ...env } = process.env;
+  const { TMUX: _, PSMUX_SESSION: __, ...env } = process.env;
   return env;
 }
 function resolveEnv(opts) {
   return opts?.stripTmux ? tmuxEnv() : process.env;
+}
+function isUnixLikeOnWindows() {
+  return process.platform === "win32" && !!(process.env.MSYSTEM || process.env.MINGW_PREFIX);
+}
+function isNativeWindowsShell() {
+  return process.platform === "win32" && !isUnixLikeOnWindows();
 }
 function quoteForCmd(arg) {
   if (arg.length === 0) return '""';
@@ -18125,7 +18131,7 @@ async function tmuxShellAsync(command, opts) {
   });
 }
 async function tmuxCmdAsync(args, opts) {
-  if (args.some((a) => a.includes("#{"))) {
+  if (args.some((a) => a.includes("#{")) && !isNativeWindowsShell()) {
     const escaped = args.map((a) => "'" + a.replace(/'/g, "'\\''") + "'").join(" ");
     return tmuxShellAsync(escaped, opts);
   }
@@ -18172,14 +18178,92 @@ async function cmuxExecAsync(args) {
     stderr: typeof result.stderr === "string" ? result.stderr : String(result.stderr ?? "")
   };
 }
+function getCmuxErrorText(error2) {
+  if (error2 instanceof Error) {
+    const stderr = typeof error2.stderr === "string" ? error2.stderr : "";
+    return `${error2.message}
+${stderr}`.trim();
+  }
+  return String(error2);
+}
+function isCmuxDialectFailure(error2) {
+  const text = getCmuxErrorText(error2);
+  return /(?:unknown|unrecognized|invalid|unsupported) (?:command|subcommand|option)|no such (?:command|subcommand)|Found argument .*--surface.*wasn't expected|unexpected argument|unexpected option/i.test(text);
+}
+function redactCmuxFailureMessage(error2, argLists) {
+  let message = getCmuxErrorText(error2);
+  const commandNames = new Set(argLists.map((args) => args[0]).filter(Boolean));
+  const sensitiveArgs = [...new Set(argLists.flatMap((args) => args).flatMap((arg) => {
+    if (!arg || commandNames.has(arg)) return [];
+    const fragments = arg.match(/[A-Za-z0-9_./:@=-]{4,}/g) ?? [];
+    return [arg, ...fragments];
+  }))].sort((a, b) => b.length - a.length);
+  for (const arg of sensitiveArgs) {
+    message = message.split(arg).join("[redacted]");
+  }
+  return message;
+}
+async function cmuxExecPrimaryWithLegacyFallback(primaryArgs, legacyArgs) {
+  try {
+    return await cmuxExecAsync(primaryArgs);
+  } catch (primaryError) {
+    if (!isCmuxDialectFailure(primaryError)) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs]);
+      const error2 = new Error(
+        `cmux command failed for current form: current=${primaryArgs[0] ?? "<unknown>"} (${primaryMessage})`
+      );
+      error2.cause = primaryError;
+      throw error2;
+    }
+    try {
+      return await cmuxExecAsync(legacyArgs);
+    } catch (legacyError) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs, legacyArgs]);
+      const legacyMessage = redactCmuxFailureMessage(legacyError, [primaryArgs, legacyArgs]);
+      throw new Error(
+        `cmux command failed for both current and legacy forms: current=${primaryArgs[0] ?? "<unknown>"} (${primaryMessage}); legacy=${legacyArgs[0] ?? "<unknown>"} (${legacyMessage})`
+      );
+    }
+  }
+}
 async function cmuxSendSurface(surfaceId, text) {
-  await cmuxExecAsync(["send", "--surface", surfaceId, text]);
+  await cmuxExecPrimaryWithLegacyFallback(
+    ["send-surface", "--surface", surfaceId, text],
+    ["send", "--surface", surfaceId, text]
+  );
+}
+function normalizeCmuxKey(key) {
+  const normalized = key.trim();
+  const lower = normalized.toLowerCase();
+  switch (lower) {
+    case "enter":
+    case "return":
+    case "tab":
+    case "escape":
+    case "esc":
+    case "backspace":
+    case "delete":
+    case "up":
+    case "down":
+    case "left":
+    case "right":
+      return lower === "return" ? "enter" : lower === "esc" ? "escape" : lower;
+    default:
+      return normalized;
+  }
 }
 async function cmuxSendSurfaceKey(surfaceId, key) {
-  await cmuxExecAsync(["send-key", "--surface", surfaceId, key]);
+  const normalizedKey = normalizeCmuxKey(key);
+  await cmuxExecPrimaryWithLegacyFallback(
+    ["send-key-surface", "--surface", surfaceId, normalizedKey],
+    ["send-key", "--surface", surfaceId, key]
+  );
 }
 async function cmuxCaptureSurface(surfaceId) {
-  const result = await cmuxExecAsync(["capture-pane", "--surface", surfaceId, "--scrollback"]);
+  const result = await cmuxExecPrimaryWithLegacyFallback(
+    ["read-screen", "--surface", surfaceId],
+    ["capture-pane", "--surface", surfaceId, "--scrollback"]
+  );
   return result.stdout;
 }
 async function cmuxCloseSurface(surfaceId) {
@@ -19721,7 +19805,7 @@ function makeJobResponse(jobId, job, extra = {}) {
 }
 var startSchema = external_exports.object({
   teamName: external_exports.string().describe('Slug name for the team (e.g. "auth-review")'),
-  agentTypes: external_exports.array(external_exports.string()).describe('Agent type per worker: "claude", "codex", or "gemini"'),
+  agentTypes: external_exports.array(external_exports.string()).describe('Agent type per worker: "claude", "codex", "gemini", or "antigravity"'),
   tasks: external_exports.array(external_exports.object({
     subject: external_exports.string().describe("Brief task title"),
     description: external_exports.string().describe("Full task description")
@@ -19981,7 +20065,7 @@ var TOOLS = [
       type: "object",
       properties: {
         teamName: { type: "string", description: "Slug name for the team" },
-        agentTypes: { type: "array", items: { type: "string" }, description: '"claude", "codex", or "gemini" per worker' },
+        agentTypes: { type: "array", items: { type: "string" }, description: '"claude", "codex", "gemini", or "antigravity" per worker' },
         tasks: {
           type: "array",
           items: {
